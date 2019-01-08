@@ -439,6 +439,50 @@ func (rc *ReplicationConn) StartReplication(slotName string, startLsn uint64, ti
 	return
 }
 
+// StartReplicationEx starts a replication connection, sending WAL data to the given replication
+// receiver. This function wraps a START_REPLICATION command as documented
+// here:
+// https://www.postgresql.org/docs/9.5/static/protocol-replication.html
+//
+// Once started, the client needs to invoke WaitForReplicationMessage() in order
+// to fetch the WAL and standby status. Also, it is the responsibility of the caller
+// to periodically send StandbyStatus messages to update the replication slot position.
+//
+// This function assumes that slotName has already been created. In order to omit the timeline argument
+// pass a -1 for the timeline to get the server default behavior.
+func (rc *ReplicationConn) StartReplicationEx(slotName string, startLsn string, timeline int64, pluginArguments ...string) (err error) {
+	queryString := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s", slotName, startLsn)
+	if timeline >= 0 {
+		timelineOption := fmt.Sprintf("TIMELINE %d", timeline)
+		pluginArguments = append(pluginArguments, timelineOption)
+	}
+
+	if len(pluginArguments) > 0 {
+		queryString += fmt.Sprintf(" ( %s )", strings.Join(pluginArguments, ", "))
+	}
+
+	if err = rc.c.sendQuery(queryString); err != nil {
+		return
+	}
+
+	ctx, cancelFn := context.WithTimeout(context.Background(), initialReplicationResponseTimeout)
+	defer cancelFn()
+
+	// The first replication message that comes back here will be (in a success case)
+	// a empty CopyBoth that is (apparently) sent as the confirmation that the replication has
+	// started. This call will either return nil, nil or if it returns an error
+	// that indicates the start replication command failed
+	var r *ReplicationMessage
+	r, err = rc.WaitForReplicationMessage(ctx)
+	if err != nil && r != nil {
+		if rc.c.shouldLog(LogLevelError) {
+			rc.c.log(LogLevelError, "Unexpected replication message", map[string]interface{}{"msg": r, "err": err})
+		}
+	}
+
+	return
+}
+
 // Create the replication slot, using the given name and output plugin.
 func (rc *ReplicationConn) CreateReplicationSlot(slotName, outputPlugin string) (err error) {
 	_, err = rc.c.Exec(fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL %s NOEXPORT_SNAPSHOT", slotName, outputPlugin))
